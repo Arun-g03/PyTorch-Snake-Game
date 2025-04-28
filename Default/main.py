@@ -9,6 +9,11 @@ from itertools import count
 import numpy as np
 import torch
 
+
+Should_Render = False #Set to True to render the game, False is for headless training
+
+
+
 def list_models(directory):
     return [f for f in os.listdir(directory) if f.endswith('.pth')]
 
@@ -66,7 +71,7 @@ def main():
     game_loop(agent, model_file, episode)
 
 
-def game_loop(agent, model_file=None, start_episode=0, render=False):
+def game_loop(agent, model_file=None, start_episode=0, render=Should_Render):
 
     # ✅ Detect and set device (GPU if available)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
