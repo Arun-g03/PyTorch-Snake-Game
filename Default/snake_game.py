@@ -54,98 +54,88 @@ def display_score(score):
     dis.blit(value, [0, 0])
 
 # Improved reward function to encourage eating food and avoid dying
-def calculate_reward(prev_distance, new_distance, snake_head, food, game_close, is_wall_collision, is_self_collision):
+def calculate_reward(prev_distance, new_distance, snake_head, food, game_close, is_wall_collision, is_self_collision, food_visible):
     if game_close:
         if is_wall_collision or is_self_collision:
-            return -500  # Penalize death
-    elif snake_head == food:
-        return 100  # Big reward for eating
-    else:
+            return -500  # Heavy death penalty
+
+    if snake_head == [food.x, food.y]:
+        return 150  # Big reward for eating food
+
+    if food_visible:
         distance_change = prev_distance - new_distance
         if distance_change > 0:
-            return 5  # Reward for getting closer
+            return 10  # ✅ Moving closer to food
         elif distance_change < 0:
-            return -2  # Mild penalty for getting farther
-        else:
-            return 2  # Tiny reward just for surviving and moving
+            return -5  # ❌ Moving farther away from food
+
+    return 2  # ✅ Small reward for surviving
+
 
 
 import math
 
 def get_state(snake_list, food, head, direction):
-    def danger_in_direction(point, snake_list):
-        """Returns 1 if the point is dangerous (wall or body), 0 otherwise."""
-        if point.x < 0 or point.x >= dis_width or point.y < 0 or point.y >= dis_height:
-            return 1
-        if [point.x, point.y] in snake_list:
-            return 1
-        return 0
+    def raycast(start, dx, dy, snake_list):
+        """Returns (normalized_distance, food_seen) along a ray."""
+        distance = 0
+        x, y = start.x, start.y
+        food_seen = 0
 
-    point_l = Point(head.x - cell_size, head.y)
-    point_r = Point(head.x + cell_size, head.y)
-    point_u = Point(head.x, head.y - cell_size)
-    point_d = Point(head.x, head.y + cell_size)
+        while 0 <= x < dis_width and 0 <= y < dis_height:
+            if [x, y] in snake_list:
+                break
+            if x == food.x and y == food.y:
+                food_seen = 1
+                break
+            x += dx * cell_size
+            y += dy * cell_size
+            distance += 1
 
-    dir_l = direction == Direction.LEFT
-    dir_r = direction == Direction.RIGHT
-    dir_u = direction == Direction.UP
-    dir_d = direction == Direction.DOWN
+        max_distance = max(dis_width, dis_height) // cell_size
+        normalized_distance = distance / max_distance
+        return normalized_distance, food_seen
 
-    # Multi-tile vision (1, 2, 3 steps ahead)
-    danger_straight = []
-    danger_right = []
-    danger_left = []
+    # Raycast in 8 directions
+    directions = [
+        (0, -1),  # N
+        (1, -1),  # NE
+        (1, 0),   # E
+        (1, 1),   # SE
+        (0, 1),   # S
+        (-1, 1),  # SW
+        (-1, 0),  # W
+        (-1, -1)  # NW
+    ]
 
-    moves = {
-        "straight": (x_dir := x_direction(dir_l, dir_r), y_dir := y_direction(dir_u, dir_d)),
-        "right": (y_dir, -x_dir),
-        "left": (-y_dir, x_dir)
-    }
+    obstacle_distances = []
+    food_seen_flags = []
 
-    for move_type, (x_step, y_step) in moves.items():
-        for distance in range(1, 4):  # look 1, 2, 3 tiles ahead
-            check_point = Point(head.x + x_step * cell_size * distance, head.y + y_step * cell_size * distance)
-            danger = danger_in_direction(check_point, snake_list)
-            if move_type == "straight":
-                danger_straight.append(danger)
-            elif move_type == "right":
-                danger_right.append(danger)
-            elif move_type == "left":
-                danger_left.append(danger)
+    for dx, dy in directions:
+        dist, food_seen = raycast(head, dx, dy, snake_list)
+        obstacle_distances.append(dist)
+        food_seen_flags.append(food_seen)
 
-    # Food direction angle
-    dx = food.x - head.x
-    dy = food.y - head.y
-    food_angle = math.atan2(dy, dx) / math.pi  # normalize between -1 and 1
-
-    # Distance to walls (normalized 0–1)
-    distance_left = head.x / dis_width
-    distance_right = (dis_width - head.x) / dis_width
-    distance_top = head.y / dis_height
-    distance_bottom = (dis_height - head.y) / dis_height
+    # Movement direction encoding
+    move_x = 0
+    move_y = 0
+    if direction[0] > 0:
+        move_x = 1
+    elif direction[0] < 0:
+        move_x = -1
+    if direction[1] > 0:
+        move_y = 1
+    elif direction[1] < 0:
+        move_y = -1
 
     # Snake length normalized
     snake_length_norm = len(snake_list) / (dis_width * dis_height / (cell_size * cell_size))
 
-    # Movement direction encoding
-    move_x = 1 if dir_r else -1 if dir_l else 0
-    move_y = 1 if dir_d else -1 if dir_u else 0
+    # Final state
+    state = obstacle_distances + food_seen_flags + [move_x, move_y, snake_length_norm]
 
-    state = [
-        *danger_straight,
-        *danger_right,
-        *danger_left,
-        food_angle,
-        distance_left,
-        distance_right,
-        distance_top,
-        distance_bottom,
-        snake_length_norm,
-        move_x,
-        move_y
-    ]
+    return np.array(state, dtype=np.float32), food_seen_flags
 
-    return np.array(state, dtype=np.float32)
 
 def x_direction(dir_l, dir_r):
     return -1 if dir_l else 1 if dir_r else 0

@@ -5,32 +5,43 @@ import numpy as np
 import os
 from datetime import datetime
 
+import torch
+import torch.nn as nn
+
 class ActorCritic(nn.Module):
     def __init__(self, input_dim, action_dim):
         super(ActorCritic, self).__init__()
-        self.shared_fc = nn.Linear(input_dim, 128)
         
+        # Shared feature extraction
+        self.shared_fc1 = nn.Linear(input_dim, 256)
+        self.shared_fc2 = nn.Linear(256, 128)
+
+        # Policy branch
         self.policy_fc = nn.Linear(128, 64)
-        self.value_fc = nn.Linear(128, 64)
-
         self.policy_head = nn.Linear(64, action_dim)
-        self.value_head = nn.Linear(64, 1)
-
         self.policy_norm = nn.LayerNorm(64)
+
+        # Value branch
+        self.value_fc = nn.Linear(128, 64)
+        self.value_head = nn.Linear(64, 1)
         self.value_norm = nn.LayerNorm(64)
 
     def forward(self, x):
-        x = torch.relu(self.shared_fc(x))
+        x = torch.relu(self.shared_fc1(x))
+        x = torch.relu(self.shared_fc2(x))
 
         # Policy branch
-        policy_x = torch.relu(self.policy_norm(self.policy_fc(x)))
-        policy_logits = self.policy_head(policy_x)
+        policy_x = torch.relu(self.policy_fc(x))
+        policy_x = self.policy_norm(policy_x)
+        logits = self.policy_head(policy_x)
 
         # Value branch
-        value_x = torch.relu(self.value_norm(self.value_fc(x)))
+        value_x = torch.relu(self.value_fc(x))
+        value_x = self.value_norm(value_x)
         value = self.value_head(value_x)
 
-        return policy_logits, value
+        return logits, value
+
 
 
 class RolloutBuffer:
@@ -59,6 +70,8 @@ class PPOAgent:
         self.gamma = gamma
         self.clip_epsilon = clip_epsilon
         self.k_epochs = k_epochs
+        self.entropy_coeff = 0.05  # Start with high exploration
+
 
         self.saved_models = []
 
@@ -83,6 +96,9 @@ class PPOAgent:
         self.buffer.dones.append(done)
 
     def optimize_model(self):
+        if len(self.buffer.states) == 0:
+            return  # Skip if buffer is empty
+
         # Convert buffers to tensors
         states = torch.cat(self.buffer.states)
         actions = torch.stack(self.buffer.actions).unsqueeze(1)
@@ -91,7 +107,7 @@ class PPOAgent:
         dones = torch.tensor(self.buffer.dones, dtype=torch.float32, device=self.device)
         values = torch.cat(self.buffer.values).squeeze(1).detach()
 
-        # Compute returns and advantages
+        # Compute returns
         returns = []
         discounted_reward = 0
         for reward, done in zip(reversed(rewards), reversed(dones)):
@@ -101,10 +117,11 @@ class PPOAgent:
             returns.insert(0, discounted_reward)
         returns = torch.tensor(returns, dtype=torch.float32, device=self.device)
 
+        # Compute advantages
         advantages = returns - values
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-
+        # PPO update
         for _ in range(self.k_epochs):
             logits, new_values = self.model(states)
             probs = torch.softmax(logits, dim=-1)
@@ -120,15 +137,19 @@ class PPOAgent:
             actor_loss = -torch.min(surr1, surr2).mean()
             critic_loss = nn.MSELoss()(new_values.squeeze(1), returns)
 
-            loss = actor_loss + 0.5 * critic_loss - 0.05 * entropy
-
+            # ✅ Use dynamic entropy coefficient
+            loss = actor_loss + 0.5 * critic_loss - self.entropy_coeff * entropy
 
             self.optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
 
+        # ✅ Decay entropy coefficient slowly
+        self.entropy_coeff = max(0.01, self.entropy_coeff * 0.999)
+
         self.buffer.clear()
+
 
     def save_model(self, episode, reward, best_reward):
         """ Save model only every 50 episodes, keep best and latest models. """
@@ -148,10 +169,10 @@ class PPOAgent:
 
         # Save best model if new best reward
         if reward > best_reward:
-            best_filename = "ppo_model_best.pth"
+            best_filename = "ppo_model_best_{best_reward}.pth"
             best_filepath = os.path.join(model_directory, best_filename)
             torch.save(self.model.state_dict(), best_filepath)
-            print(f"New best model saved: {best_filename}")
+            print(f"\n\nNew best model saved: {best_filename}\n\n")
             return reward  # ✅ Update best_reward if new best
 
         return best_reward  # ✅ Otherwise, return unchanged best_reward

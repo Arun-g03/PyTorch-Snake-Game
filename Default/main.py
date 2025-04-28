@@ -24,7 +24,7 @@ def extract_episode_number(filename):
     return None
 
 def main():
-    state_dim = 17  # Number of features in the state representation
+    state_dim = 19  # Number of features in the state representation
     action_dim = 4  # Number of possible actions (left, right, up, down)
 
     agent = PPOAgent(state_dim, action_dim)
@@ -170,7 +170,8 @@ def game_loop(agent, model_file=None, start_episode=0, render=Should_Render):
                     pygame.quit()
                     quit()
 
-            state = get_state(snake_List, Point(foodx, foody), Point(x1, y1), (x1_change, y1_change))
+            state, food_seen_flags = get_state(snake_List, Point(foodx, foody), Point(x1, y1), (x1_change, y1_change))
+
             action = agent.select_action(state)
 
             # Move snake
@@ -216,7 +217,11 @@ def game_loop(agent, model_file=None, start_episode=0, render=Should_Render):
             is_self_collision = any(x == snake_Head for x in snake_List[:-1])
 
             new_distance = abs(x1 - foodx) + abs(y1 - foody)
-            reward = calculate_reward(prev_distance, new_distance, snake_Head, Point(foodx, foody), game_close, is_wall_collision, is_self_collision)
+            # Calculate food_visible flag (1 if food seen in any raycast)
+            food_visible = any(food_seen_flags)
+
+            reward = calculate_reward(prev_distance, new_distance, snake_Head, Point(foodx, foody), game_close, is_wall_collision, is_self_collision, food_visible)
+
             total_reward += reward
             prev_distance = new_distance
 
