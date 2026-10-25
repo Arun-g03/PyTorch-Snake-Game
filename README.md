@@ -25,7 +25,7 @@ python main.py
 
 Choose **1** to train a new model, **2** to continue a saved one, **3** to watch a saved model play, or **4** to evolve a population of PPO agents in parallel. Training asks whether to show the game window; it is headless by default. Press `Ctrl+C` to stop – the latest model is saved first.
 
-Training plays `NUM_ENVS` games at once (default 8) and chooses all their moves in one batched forward pass; showing the game window (or watching a model) uses a single game. Pick the agent with `MODEL_TYPE = "ppo"` or `"dqn"` in `config.py`. Checkpoints are suffixed with the model type: `models/ptorch_latest_<type>.pth` (every 50 episodes and on exit) and `models/ptorch_best_<type>.pth` (best rolling-average reward). The load menu only lists checkpoints for the current `MODEL_TYPE`. Older checkpoints (e.g. `ptorch_ppo_latest.pth`) use the previous naming and a different network shape, so they won't be listed or load.
+Training simulates `NUM_ENVS` games at once as tensors (`Default/vec_game.py`) and chooses all their moves in one batched forward pass. With `NUM_ENVS = "auto"` that is 256 games on a GPU and 16 on a CPU; on a GPU the whole loop stays on the device, so more games cost very little. Showing the game window (or watching a model) uses a single game. `python Default/test_vec_game.py` checks that the tensor game behaves exactly like the readable single-game reference in `snake_game.py`. Pick the agent with `MODEL_TYPE = "ppo"` or `"dqn"` in `config.py`. Checkpoints are suffixed with the model type: `models/ptorch_latest_<type>.pth` (every 50 episodes and on exit) and `models/ptorch_best_<type>.pth` (best rolling-average reward). The load menu only lists checkpoints for the current `MODEL_TYPE`. Older checkpoints (e.g. `ptorch_ppo_latest.pth`) use the previous naming and a different network shape, so they won't be listed or load.
 
 ### Evolution (option 4)
 
@@ -35,8 +35,8 @@ Several PPO agents train in separate processes. After each generation the fittes
 
 - **Actions (3):** go straight, turn right, turn left – the snake can never reverse into itself.
 - **State (44 values):** for 8 rays: distance to wall, distance to body, food closeness; one-hot heading and normalised length; for each move (straight / right / left): wall ahead, own body ahead and free space reachable (trap detection); and the food's position relative to the head.
-- **Rewards:** +10 food, −10 death or stalling (no food for `100 × length` steps), ±0.1 for moving closer to / farther from food.
+- **Rewards:** +1 food, −1 death or stalling (no food for `100 × length` steps), ±0.01 for moving closer to / farther from food (the `REWARD_*` values in `config.py`; small rewards train about twice as fast). A checkpoint remembers the rewards it was trained with, and loading it under different ones prints a warning.
 
 ## Running on a Raspberry Pi
 
-Use the same code with a lighter setup in `config.py`: set `DEVICE = "cpu"`, shrink `PPO_NETWORK` (e.g. 64 / 32 / 16) and lower `PPO_HPARAMS["update_steps"]`. Train headless (answer **n** to the window prompt).
+Use the same code with a lighter setup in `config.py`: set `DEVICE = "cpu"`, shrink `PPO_NETWORK` (e.g. 64 / 32 / 16) and lower `PPO_HPARAMS["rollout_steps"]`. Train headless (answer **n** to the window prompt).

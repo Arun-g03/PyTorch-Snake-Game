@@ -7,6 +7,15 @@ import torch
 import config
 
 
+# Rewards used before checkpoints recorded them
+LEGACY_REWARDS = {"food": 10.0, "death": -10.0, "closer": 0.1, "farther": -0.1}
+
+
+def current_rewards():
+    return {"food": config.REWARD_FOOD, "death": config.REWARD_DEATH,
+            "closer": config.REWARD_CLOSER, "farther": config.REWARD_FARTHER}
+
+
 def checkpoint_name(kind, model_type):
     """e.g. ptorch_latest_ppo.pth - the model type is the suffix."""
     return f"{config.PYTORCH_PREFIX}_{kind}_{model_type}.pth"
@@ -22,7 +31,8 @@ def list_checkpoints(model_type):
 
 def _write(state_dict, filename, episode, best_score):
     os.makedirs(config.MODEL_DIR, exist_ok=True)
-    torch.save({"model_state": state_dict, "episode": episode, "best_score": best_score},
+    torch.save({"model_state": state_dict, "episode": episode, "best_score": best_score,
+                "rewards": current_rewards()},
                os.path.join(config.MODEL_DIR, filename))
 
 
@@ -54,6 +64,13 @@ def load(model, filename, device):
     if isinstance(checkpoint, dict) and "model_state" in checkpoint:
         model.load_state_dict(checkpoint["model_state"])
         episode, best_score = checkpoint["episode"], checkpoint["best_score"]
+        saved = checkpoint.get("rewards", LEGACY_REWARDS)
+        if saved != current_rewards():
+            print(f"WARNING: this model was trained with rewards {saved}, but config.py has {current_rewards()}. "
+                  f"Its value estimates will not match the new reward size and need to re-adapt; set the "
+                  f"REWARD_* values in config.py back to the saved ones to continue it as it was trained. "
+                  f"The saved best score is not comparable, so it is reset.")
+            best_score = -float('inf')
     else:
         model.load_state_dict(checkpoint)
         episode, best_score = 0, -float('inf')

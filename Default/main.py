@@ -20,6 +20,7 @@ from PPO import PPOAgent
 
 PLOT_SECONDS = config.PLOT_SECONDS
 PRINT_SECONDS = config.PRINT_SECONDS
+HILO_FRACTION = config.HILO_FRACTION
 AVG_WINDOW = config.AVG_WINDOW
 PLOT_WINDOW = config.PLOT_WINDOW
 
@@ -155,6 +156,17 @@ def watch(agent, env):
         env.close()
 
 
+def tail_means(values, fraction=HILO_FRACTION):
+    """(low, high): the mean of the worst and of the best `fraction` of `values` (at least one each).
+
+    Unlike the plain min / max, one lucky or unlucky episode cannot move it, and it shows whether the
+    whole spread of results is improving - including the weak runs.
+    """
+    ordered = np.sort(np.asarray(values, dtype=np.float64))
+    k = max(1, int(len(ordered) * fraction))
+    return float(ordered[:k].mean()), float(ordered[-k:].mean())
+
+
 def make_plot():
     plt.ion()
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 6))
@@ -164,6 +176,12 @@ def make_plot():
         'reward': ax2.plot([], [], lw=2, label='Total Reward')[0],
         'reward_avg': ax2.plot([], [], lw=2, linestyle='--', label='Average Reward')[0],
     }
+    # High / low over the same rolling window as the average, drawn thin and dotted in the average's colour
+    window = f'Avg of top / bottom {HILO_FRACTION:.0%} (last {AVG_WINDOW})'
+    for key, ax, avg in (('food', ax1, 'food_avg'), ('reward', ax2, 'reward_avg')):
+        color = lines[avg].get_color()
+        lines[f'{key}_hi'] = ax.plot([], [], lw=1, linestyle=':', color=color, label=window)[0]
+        lines[f'{key}_lo'] = ax.plot([], [], lw=1, linestyle=':', color=color)[0]
     ax1.set_xlabel('Episode (this run)')
     ax1.set_ylabel('Food Eaten')
     ax1.legend()
@@ -182,6 +200,8 @@ def train(agent, env, start_episode=0, best_score=-float('inf'), render=False):
     reward_data = deque(maxlen=PLOT_WINDOW)
     food_avg_data = deque(maxlen=PLOT_WINDOW)
     reward_avg_data = deque(maxlen=PLOT_WINDOW)
+    food_hi_data, food_lo_data = deque(maxlen=PLOT_WINDOW), deque(maxlen=PLOT_WINDOW)
+    reward_hi_data, reward_lo_data = deque(maxlen=PLOT_WINDOW), deque(maxlen=PLOT_WINDOW)
     recent_food = deque(maxlen=AVG_WINDOW)
     recent_reward = deque(maxlen=AVG_WINDOW)
 
@@ -190,6 +210,10 @@ def train(agent, env, start_episode=0, best_score=-float('inf'), render=False):
         lines['food_avg'].set_data(xdata, food_avg_data)
         lines['reward'].set_data(xdata, reward_data)
         lines['reward_avg'].set_data(xdata, reward_avg_data)
+        lines['food_hi'].set_data(xdata, food_hi_data)
+        lines['food_lo'].set_data(xdata, food_lo_data)
+        lines['reward_hi'].set_data(xdata, reward_hi_data)
+        lines['reward_lo'].set_data(xdata, reward_lo_data)
         for ax in (ax1, ax2):
             ax.relim()
             ax.autoscale_view()
@@ -224,6 +248,12 @@ def train(agent, env, start_episode=0, best_score=-float('inf'), render=False):
                 finished = len(scores)
                 food_avg_data.extend([float(np.mean(recent_food))] * finished)
                 reward_avg_data.extend([float(np.mean(recent_reward))] * finished)
+                food_lo, food_hi = tail_means(recent_food)
+                reward_lo, reward_hi = tail_means(recent_reward)
+                food_lo_data.extend([food_lo] * finished)
+                food_hi_data.extend([food_hi] * finished)
+                reward_lo_data.extend([reward_lo] * finished)
+                reward_hi_data.extend([reward_hi] * finished)
 
                 # Save when this batch of episodes crossed a SAVE_EVERY boundary. The best model is
                 # judged on the rolling average, not a single lucky episode.
@@ -240,8 +270,12 @@ def train(agent, env, start_episode=0, best_score=-float('inf'), render=False):
             now = time.monotonic()
             if now - last_print >= PRINT_SECONDS and recent_food:
                 rate = (env_steps - steps_at_print) / (now - last_print)
-                print(f"Episode {episode} | avg score {np.mean(recent_food):.1f} (best {max(recent_food)}) | "
-                      f"avg reward {np.mean(recent_reward):.1f} | {rate:,.0f} steps/s")
+                food_lo, food_hi = tail_means(recent_food)
+                reward_lo, reward_hi = tail_means(recent_reward)
+                print(f"Episode {episode} | food avg {np.mean(recent_food):.1f} "
+                      f"(low {food_lo:.1f}, high {food_hi:.1f}) | "
+                      f"reward avg {np.mean(recent_reward):.2f} "
+                      f"(low {reward_lo:.2f}, high {reward_hi:.2f}) | {rate:,.0f} steps/s")
                 last_print, steps_at_print = now, env_steps
             if now - last_plot >= PLOT_SECONDS and xdata:
                 update_plot()

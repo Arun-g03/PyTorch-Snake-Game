@@ -22,22 +22,26 @@ CELL_SIZE = 20           # board is (DIS_WIDTH / CELL_SIZE) x (DIS_HEIGHT / CELL
 SNAKE_SPEED = 30         # frames per second when rendering (PyTorch version)
 STEP_LIMIT_FACTOR = 200  # an episode ends after this many steps per snake segment without food
 
-REWARD_FOOD = 10.0
-REWARD_DEATH = -10.0     # also used when the snake stalls (hits the step limit)
-REWARD_CLOSER = 0.1      # moved closer to the food
-REWARD_FARTHER = -0.1    # moved farther from the food
+# Keep rewards small (food ~ 1): it trains about twice as fast as food = 10, because the value
+# estimates and gradients stay near 1. A checkpoint remembers the values it was trained with and warns
+# when it is loaded under different ones.
+REWARD_FOOD = 1.0
+REWARD_DEATH = -1.0      # also used when the snake stalls (hits the step limit)
+REWARD_CLOSER = 0.01     # moved closer to the food
+REWARD_FARTHER = -0.01   # moved farther from the food
 
 # ---------------------------------------------------------------------------
 # PyTorch agents (Default/)
 # ---------------------------------------------------------------------------
 MODEL_TYPE = "ppo"          # "ppo" or "dqn" - which agent to train / watch
 PYTORCH_PREFIX = "ptorch"   # checkpoints are saved as <prefix>_<latest|best>_<MODEL_TYPE>.pth
-NUM_ENVS = 5                # games simulated in parallel while training: a number, or "auto" (256 on a GPU, 16 on a CPU)
+NUM_ENVS = "auto"                # games simulated in parallel while training: a number, or "auto" (256 on a GPU, 16 on a CPU)
 DEVICE = "auto"             # "auto" (use CUDA if available), "cuda" or "cpu"
 
 SAVE_EVERY = 50             # episodes between "latest" checkpoints
 PRINT_SECONDS = 2.0          # how often the console shows a progress line
 PLOT_SECONDS = 2.0           # redraw the training plot at most this often (redraws are slow)
+HILO_FRACTION = 0.1          # "high" / "low" = the average of the best / worst this fraction of the window
 AVG_WINDOW = 100            # episodes in the rolling average (also used to pick the best model)
 PLOT_WINDOW = 400          # episodes kept on the plot
 
@@ -52,16 +56,16 @@ PPO_NETWORK = dict(
 
 # --- PPO ---
 PPO_HPARAMS = dict(
-    gamma=0.99,             # discount factor
-    gae_lambda=0.95,        # GAE bias/variance trade-off
+    gamma=0.995,            # discount factor (credit reaches ~1 / (1 - gamma * gae_lambda) steps back)
+    gae_lambda=0.98,        # GAE bias/variance trade-off; higher = longer-range credit assignment
     lr=3e-4,                # initial learning rate
-    lr_min=3e-5,            # learning rate floor
+    lr_min=1e-4,            # learning rate floor
     lr_decay=0.995,         # lr multiplier after every update
     clip_epsilon=0.2,       # PPO clip range
     k_epochs=10,            # passes over each rollout (cut short by target_kl)
     target_kl=0.02,         # stop the epochs early if the policy moved this far
     rollout_steps=128,      # steps each game plays between updates (batch = rollout_steps x NUM_ENVS)
-    num_minibatches=8,      # minibatches per epoch, so the batch size scales with NUM_ENVS
+    num_minibatches=32,     # minibatches per epoch (more = more gradient steps per update); batch size scales with NUM_ENVS
     value_coeff=0.5,
     entropy_coeff=0.05,     # initial entropy bonus
     entropy_min=0.01,
