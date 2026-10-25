@@ -1,5 +1,7 @@
 # Suggested Fixes
 
+> **Status: all items below have been applied.** (The `Raspberry_snake/` TensorFlow variant they mention has since been removed; its items no longer apply.) The game logic was rewritten as a `SnakeGame` class (relative actions, grid coordinates, rays for wall/body/food) in both variants. Notable changes versus the list: the single best model is now `models/ppo_model_best.pth` (judged on rolling-average reward), checkpoints store `episode` and `best_score`, and PPO updates every 2048 steps with GAE instead of once per episode.
+
 Issues found by reading the code in `Default/` (PyTorch PPO) and `Raspberry_snake/` (TensorFlow DQN), ordered by severity.
 
 ## 🔴 Bugs

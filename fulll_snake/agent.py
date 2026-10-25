@@ -232,9 +232,37 @@ class PPOAgent:
         self.k_epochs = k_epochs
         self.state_dim = state_dim
         self.action_dim = action_dim
+        self.lr = lr
 
         self.saved_models = []
         self.fitness = 0  # Track agent's performance
+
+    def to(self, device):
+        """Move the agent (model, optimizer state and rollout buffer) to `device`."""
+        self.device = torch.device(device)
+        self.model.to(self.device)
+        for state in self.optimizer.state.values():
+            for k, v in state.items():
+                if torch.is_tensor(v):
+                    state[k] = v.to(self.device)
+        self.buffer.clear()
+        return self
+
+    # Agents are sent between worker processes. CUDA tensors that were received from another
+    # process cannot be re-sent, so agents always travel as a CPU copy of their weights.
+    def __getstate__(self):
+        return {
+            "state_dim": self.state_dim, "action_dim": self.action_dim,
+            "gamma": self.gamma, "lr": self.lr, "clip_epsilon": self.clip_epsilon,
+            "k_epochs": self.k_epochs, "fitness": self.fitness,
+            "model_state": {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()},
+        }
+
+    def __setstate__(self, state):
+        self.__init__(state["state_dim"], state["action_dim"], state["gamma"], state["lr"],
+                      state["clip_epsilon"], state["k_epochs"], device='cpu')
+        self.model.load_state_dict(state["model_state"])
+        self.fitness = state["fitness"]
 
     def mutate(self, mutation_rate=0.1, mutation_scale=0.1):
         """Apply random mutations to the model parameters"""
@@ -247,7 +275,8 @@ class PPOAgent:
 
     def crossover(self, other_agent):
         """Create a new agent by combining parameters from two parent agents"""
-        child = PPOAgent(self.state_dim, self.action_dim, device=self.device)
+        child = PPOAgent(self.state_dim, self.action_dim, self.gamma, self.lr,
+                         self.clip_epsilon, self.k_epochs, device=self.device)
         
         with torch.no_grad():
             for (name1, param1), (name2, param2), (name3, param3) in zip(
@@ -263,7 +292,8 @@ class PPOAgent:
 
     def clone(self):
         """Create a copy of the current agent"""
-        clone = PPOAgent(self.state_dim, self.action_dim, device=self.device)
+        clone = PPOAgent(self.state_dim, self.action_dim, self.gamma, self.lr,
+                         self.clip_epsilon, self.k_epochs, device=self.device)
         clone.model.load_state_dict(self.model.state_dict())
         return clone
 
@@ -338,6 +368,19 @@ class PPOAgent:
 
         self.buffer.clear()
         return loss.item()
+
+    BEST_MODEL_FILE = "ptorch_evo_best.pth"
+
+    def save_best(self, score, state_dict=None):
+        """Overwrite the single best-model file (the only checkpoint kept for evolution/training runs).
+
+        `state_dict` lets a caller save a snapshot taken earlier; defaults to the current weights.
+        """
+        os.makedirs("./models", exist_ok=True)
+        state = state_dict if state_dict is not None else self.model.state_dict()
+        torch.save({k: v.detach().cpu() for k, v in state.items()},
+                   os.path.join("./models", self.BEST_MODEL_FILE))
+        print(f"New best model saved (score {score}): {self.BEST_MODEL_FILE}")
 
     def save_model(self, episode, agent_id=None):
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")

@@ -1,123 +1,32 @@
+import random
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
-import random
-import os
-from datetime import datetime
+
+import config  # repo root is put on sys.path by main.py
+import checkpoints
+
 
 class DQN(nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super(DQN, self).__init__()
-        self.fc1 = nn.Linear(input_dim, 512)
-        self.fc2 = nn.Linear(512, 256)
-        self.fc3 = nn.Linear(256, 128)
-        self.fc4 = nn.Linear(128, 64)
-        self.fc5 = nn.Linear(64, output_dim)
-    
+    def __init__(self, input_dim, output_dim, hidden=None):
+        super().__init__()
+        sizes = [input_dim, *(hidden or config.DQN_NETWORK)]
+        self.hidden = nn.ModuleList(nn.Linear(a, b) for a, b in zip(sizes[:-1], sizes[1:]))
+        self.out = nn.Linear(sizes[-1], output_dim)
+
     def forward(self, x):
-        x = torch.relu(self.fc1(x))
-        x = torch.relu(self.fc2(x))
-        x = torch.relu(self.fc3(x))
-        x = torch.relu(self.fc4(x))
-        return self.fc5(x)
+        for layer in self.hidden:
+            x = torch.relu(layer(x))
+        return self.out(x)
 
-class DQNAgent:
-    """
-    DQN Network for the snake
-    
-    """
-    def __init__(self, state_dim, action_dim, memory_size=10000, batch_size=64, gamma=0.99, lr=0.001, target_update=10, device='cpu'):
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-        self.memory = PrioritizedReplayMemory(memory_size, state_dim, device=device)
-        self.batch_size = batch_size
-        self.gamma = gamma
-        self.lr = lr
-        self.target_update = target_update
-        self.device = device
-
-        self.policy_net = DQN(state_dim, action_dim).to(device)
-        self.target_net = DQN(state_dim, action_dim).to(device)
-        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=lr)
-        self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=1000, gamma=0.9)
-        self.loss_fn = nn.SmoothL1Loss(reduction='none')
-        self.steps_done = 0
-        self.saved_models = []  # List to store saved model filenames
-        self.update_target_net()
-
-    def select_action(self, state, epsilon):
-        if random.random() < epsilon:
-            return random.randrange(self.action_dim)
-        with torch.no_grad():
-            state = torch.as_tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
-            return self.policy_net(state).argmax().item()
-
-    def store_transition(self, state, action, reward, next_state, done, msa):
-        self.memory.push(state, action, reward, next_state, done, msa)
-
-    def update_target_net(self):
-        self.target_net.load_state_dict(self.policy_net.state_dict())
-
-    def optimize_model(self, beta=0.4):
-        if len(self.memory) < self.batch_size:
-            return None
-        transitions, indices, weights = self.memory.sample(self.batch_size, beta)
-        state_batch, action_batch, reward_batch, next_state_batch, done_batch, msa_batch = transitions
-
-        state_action_values = self.policy_net(state_batch).gather(1, action_batch)
-
-        with torch.no_grad():
-            next_state_values = torch.zeros(self.batch_size, device=self.device)
-            non_final_mask = (done_batch == 0).squeeze(1)
-            if non_final_mask.any():
-                non_final_next_states = next_state_batch[non_final_mask]
-                next_state_values[non_final_mask] = self.target_net(non_final_next_states).max(1)[0]
-
-            expected_state_action_values = (next_state_values.unsqueeze(1) * self.gamma) * (1 - done_batch) + reward_batch
-
-        td_errors = self.loss_fn(state_action_values, expected_state_action_values)
-        loss = (td_errors * weights.unsqueeze(1)).mean()
-
-        self.optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=1.0)
-        self.optimizer.step()
-        self.scheduler.step()
-
-        priorities = td_errors.abs().detach().cpu().numpy() + 1e-5
-        self.memory.update_priorities(indices, priorities)
-
-        return loss.item()
-
-    def save_model(self, episode):
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        filename = f"model_ep{episode}_{timestamp}.pth"
-        model_directory = "./models"
-        if not os.path.exists(model_directory):
-            os.makedirs(model_directory)
-        filepath = os.path.join(model_directory, filename)
-        torch.save(self.policy_net.state_dict(), filepath)
-        self.saved_models.append(filepath)
-        print(f"Model saved as {filename}")
-        self.manage_saved_models()
-
-    def manage_saved_models(self):
-        if len(self.saved_models) > 3:
-            oldest_model = self.saved_models.pop(0)
-            if os.path.exists(oldest_model):
-                os.remove(oldest_model)
-                print(f"Removed oldest model: {oldest_model}")
-
-    def load_model(self, filename):
-        self.policy_net.load_state_dict(torch.load(filename, map_location=self.device))
-        self.update_target_net()
-        print(f"Model loaded from {filename}")
 
 class PrioritizedReplayMemory:
     def __init__(self, capacity, state_dim, alpha=0.6, device='cpu'):
         self.capacity = capacity
         self.position = 0
+        self.size = 0
         self.alpha = alpha
         self.device = device
 
@@ -126,58 +35,143 @@ class PrioritizedReplayMemory:
         self.rewards = torch.zeros((capacity, 1), dtype=torch.float32, device=device)
         self.next_states = torch.zeros((capacity, state_dim), dtype=torch.float32, device=device)
         self.dones = torch.zeros((capacity, 1), dtype=torch.float32, device=device)
-        self.msas = torch.zeros((capacity, 1), dtype=torch.float32, device=device)
-
         self.priorities = torch.zeros((capacity,), dtype=torch.float32, device=device)
 
-    def push(self, state, action, reward, next_state, done, msa):
-        state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
-        action = torch.as_tensor([action], dtype=torch.int64, device=self.device)
-        reward = torch.as_tensor([reward], dtype=torch.float32, device=self.device)
-        next_state = torch.as_tensor(next_state, dtype=torch.float32, device=self.device)
-        done = torch.as_tensor([done], dtype=torch.float32, device=self.device)
-        msa = torch.as_tensor([msa], dtype=torch.float32, device=self.device)
-
-        max_priority = self.priorities.max().item() if self.position > 0 else 1.0
-        self.states[self.position] = state
-        self.actions[self.position] = action
-        self.rewards[self.position] = reward
-        self.next_states[self.position] = next_state
-        self.dones[self.position] = done
-        self.msas[self.position] = msa
-        self.priorities[self.position] = max_priority
+    def push(self, state, action, reward, next_state, done):
+        max_priority = self.priorities[:self.size].max().item() if self.size > 0 else 1.0
+        i = self.position
+        self.states[i] = torch.as_tensor(state, dtype=torch.float32, device=self.device)
+        self.actions[i] = action
+        self.rewards[i] = reward
+        self.next_states[i] = torch.as_tensor(next_state, dtype=torch.float32, device=self.device)
+        self.dones[i] = float(done)
+        self.priorities[i] = max_priority
         self.position = (self.position + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
 
     def sample(self, batch_size, beta=0.4):
-        if self.position == self.capacity:
-            priorities = self.priorities
-        else:
-            priorities = self.priorities[:self.position]
-        probabilities = priorities ** self.alpha
-        probabilities /= probabilities.sum()
+        probabilities = self.priorities[:self.size] ** self.alpha
+        probabilities = probabilities / probabilities.sum()
 
         indices = torch.multinomial(probabilities, batch_size, replacement=False)
-        weights = (len(probabilities) * probabilities[indices]) ** (-beta)
-        weights /= weights.max()
+        weights = (self.size * probabilities[indices]) ** (-beta)
+        weights = weights / weights.max()
 
-        state_batch = self.states[indices]
-        action_batch = self.actions[indices]
-        reward_batch = self.rewards[indices]
-        next_state_batch = self.next_states[indices]
-        done_batch = self.dones[indices]
-        msa_batch = self.msas[indices]
+        batch = (self.states[indices], self.actions[indices], self.rewards[indices],
+                 self.next_states[indices], self.dones[indices])
+        return batch, indices, weights
 
-        return (state_batch, action_batch, reward_batch, next_state_batch, done_batch, msa_batch), indices, weights
-
-    def update_priorities(self, batch_indices, batch_priorities):
-        batch_priorities = torch.as_tensor(batch_priorities, dtype=torch.float32, device=self.device).view(-1)
-        if batch_priorities.shape != torch.Size([len(batch_indices)]):
-            raise ValueError(f"Expected batch_priorities shape to be {[len(batch_indices)]}, but got {batch_priorities.shape}")
-        self.priorities[batch_indices] = batch_priorities
+    def update_priorities(self, indices, priorities):
+        self.priorities[indices] = torch.as_tensor(priorities, dtype=torch.float32, device=self.device).view(-1)
 
     def __len__(self):
-        return min(self.position, self.capacity)
+        return self.size
 
 
+class DQNAgent:
+    """Double DQN with prioritised replay. Same interface as PPOAgent (see main.py)."""
+    model_type = "dqn"
 
+    def __init__(self, state_dim, action_dim, device='cpu', num_envs=1, **overrides):
+        unknown = set(overrides) - set(config.DQN_HPARAMS)
+        if unknown:
+            raise TypeError(f"Unknown hyperparameters: {sorted(unknown)}")
+        self.hparams = h = {**config.DQN_HPARAMS, **overrides}
 
+        self.action_dim = action_dim
+        self.device = device
+        self.gamma = h['gamma']
+        self.batch_size = h['batch_size']
+        self.memory = PrioritizedReplayMemory(h['memory_size'], state_dim, device=device)
+
+        self.model = DQN(state_dim, action_dim).to(device)  # the policy network ("model" for checkpoints)
+        self.target_net = DQN(state_dim, action_dim).to(device)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=h['lr'], foreach=True)
+        self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, h['lr_step_size'], h['lr_gamma'])
+        self.loss_fn = nn.SmoothL1Loss(reduction='none')
+
+        self.env_steps = 0    # actions chosen so far (drives epsilon and beta)
+        self._train_credit = 0  # environment steps not yet 'spent' on an optimisation step
+        self.opt_steps = 0    # optimisation steps so far (drives target sync)
+        self.update_target_net()
+
+    @property
+    def epsilon(self):
+        h = self.hparams
+        frac = min(1.0, self.env_steps / h['epsilon_decay_steps'])
+        return h['epsilon_start'] + frac * (h['epsilon_end'] - h['epsilon_start'])
+
+    @property
+    def beta(self):
+        h = self.hparams
+        frac = min(1.0, self.env_steps / h['beta_frames'])
+        return h['beta_start'] + frac * (1.0 - h['beta_start'])
+
+    @torch.inference_mode()
+    def act(self, state, greedy=True):
+        """Best action for one `state` (greedy), or epsilon-greedy when greedy=False."""
+        if not greedy and random.random() < self.epsilon:
+            return random.randrange(self.action_dim)
+        state = torch.as_tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
+        return self.model(state).argmax(dim=1).item()
+
+    # Common agent interface used by main.py ---------------------------------------------------
+    @torch.inference_mode()
+    def select_actions(self, states):
+        """Epsilon-greedy actions for a batch of states, one per environment."""
+        states = torch.as_tensor(np.asarray(states), dtype=torch.float32, device=self.device)
+        greedy = self.model(states).argmax(dim=1).cpu().numpy()
+        explore = np.random.random(len(greedy)) < self.epsilon
+        actions = np.where(explore, np.random.randint(self.action_dim, size=len(greedy)), greedy)
+        self.env_steps += len(actions)
+        return actions
+
+    def observe(self, env_index, state, action, reward, next_state, done):
+        self.memory.push(state, action, reward, next_state, done)
+
+    def update(self, next_states):
+        # Learning on every environment step is the main cost; every few steps trains nearly as well
+        self._train_credit += len(next_states)
+        while self._train_credit >= self.hparams['train_every']:
+            self._train_credit -= self.hparams['train_every']
+            self.optimize_model()
+
+    def update_target_net(self):
+        self.target_net.load_state_dict(self.model.state_dict())
+
+    def optimize_model(self):
+        if len(self.memory) < self.batch_size:
+            return None
+        (states, actions, rewards, next_states, dones), indices, weights = \
+            self.memory.sample(self.batch_size, self.beta)
+
+        q_values = self.model(states).gather(1, actions)
+        with torch.no_grad():
+            # Double DQN: the policy net picks the action, the target net scores it
+            best_next = self.model(next_states).argmax(dim=1, keepdim=True)
+            next_q = self.target_net(next_states).gather(1, best_next)
+            targets = rewards + self.gamma * next_q * (1 - dones)
+
+        td_errors = self.loss_fn(q_values, targets)
+        loss = (td_errors * weights.unsqueeze(1)).mean()
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(self.model.parameters(), self.hparams['max_grad_norm'])
+        self.optimizer.step()
+        self.scheduler.step()
+
+        self.memory.update_priorities(indices, (targets - q_values).abs().detach() + 1e-5)
+
+        self.opt_steps += 1
+        if self.opt_steps % self.hparams['target_update'] == 0:
+            self.update_target_net()
+        return loss.item()
+
+    def save_model(self, episode, score, best_score, force=False):
+        return checkpoints.save(self.model, self.model_type, episode, score, best_score, force)
+
+    def load_model(self, filename):
+        result = checkpoints.load(self.model, filename, self.device)
+        self.update_target_net()
+        return result

@@ -137,3 +137,6 @@ node_modules/
 # Local configuration
 # ==============================
 *.local
+
+# Per-framework virtual environments (see env.ps1)
+.venv-*/

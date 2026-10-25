@@ -1,3 +1,6 @@
+import os
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+
 import pygame
 import random
 import numpy as np
@@ -15,9 +18,6 @@ class Direction:
     UP = 2
     DOWN = 3
 
-# Initialize Pygame
-pygame.init()
-
 # Define colors
 white = (255, 255, 255)
 yellow = (255, 255, 102)
@@ -30,18 +30,29 @@ blue = (50, 153, 213)
 dis_width = 400
 dis_height = 400
 
-# Create display
-dis = pygame.display.set_mode((dis_width, dis_height))
-pygame.display.set_caption('Snake Game')
-
-# Define clock and cell size
-clock = pygame.time.Clock()
 cell_size = 20  # Cell size variable
 snake_speed = 15
 
-# Define font styles
-font_style = pygame.font.SysFont(None, 50)
-score_font = pygame.font.SysFont(None, 35)
+# The display, clock and fonts are created lazily by init_display(), so importing this module
+# (e.g. in every headless worker process) never opens a window.
+dis = None
+clock = None
+font_style = None
+score_font = None
+
+
+def init_display():
+    """Open the game window. Call once, and only when actually rendering."""
+    global dis, clock, font_style, score_font
+    if dis is not None:
+        return
+    pygame.init()
+    dis = pygame.display.set_mode((dis_width, dis_height))
+    pygame.display.set_caption('Snake Game')
+    clock = pygame.time.Clock()
+    font_style = pygame.font.SysFont(None, 50)
+    score_font = pygame.font.SysFont(None, 35)
+
 
 def our_snake(cell_size, snake_List):
     for x in snake_List:

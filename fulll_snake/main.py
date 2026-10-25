@@ -2,6 +2,7 @@ import sys
 import os
 import re
 from snake_game import *
+import snake_game as sg  # display/clock are created lazily, so always reach them through the module
 from agent import DQNAgent, PPOAgent
 import matplotlib.pyplot as plt
 from itertools import count
@@ -46,6 +47,7 @@ def train_snake(agent_id, num_episodes, device, population=None, generation=0):
         else:
             agent = parents[0].clone()
             agent.mutate(mutation_rate=0.2, mutation_scale=0.2)
+        agent.to(device)  # parents arrive as CPU copies from the main process
     else:
         agent = PPOAgent(
             state_dim=state_dim,
@@ -66,9 +68,8 @@ def train_snake(agent_id, num_episodes, device, population=None, generation=0):
     last_reset_episode = 0
     min_episodes_between_reset = 20  # Minimum episodes before allowing another reset
     
-    # Track top 4 performances
-    top_performances = []  # List of tuples (score, steps, food, episode)
-    
+    best_state = None  # in-memory snapshot of the best weights; the parent decides what to write to disk
+
     while episode < num_episodes:
         game_over = False
         game_close = False
@@ -148,29 +149,11 @@ def train_snake(agent_id, num_episodes, device, population=None, generation=0):
         agent.update_fitness(score, steps, total_food_eaten)
         print(f'Generation {generation} - Agent {agent_id} - Episode {episode} - Score: {score}, Total Loss: {total_loss:.2f}, Total Reward: {total_reward:.2f}, Steps: {steps}, Food Eaten: {total_food_eaten}, Fitness: {agent.fitness:.2f}')
         
-        # Update best performances
-        current_performance = (score, steps, total_food_eaten, episode)
-        top_performances.append(current_performance)
-        top_performances.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)  # Sort by score, then steps, then food
-        top_performances = top_performances[:4]  # Keep only top 4
-        
-        # Save model if it's in top 4
-        if current_performance in top_performances:
-            # Delete old model files if we have more than 4
-            model_files = [f for f in os.listdir("./models") if f.startswith(f"agent{agent_id}_gen{generation}")]
-            if len(model_files) >= 4:
-                # Sort by episode number and remove oldest
-                model_files.sort(key=lambda x: extract_episode_number(x))
-                os.remove(os.path.join("./models", model_files[0]))
-            
-            # Save new model
-            agent.save_model(episode, f"agent{agent_id}_gen{generation}")
-            print(f"Saved model for episode {episode} (Score: {score}, Steps: {steps}, Food: {total_food_eaten})")
-        
         if score > best_score:
             best_score = score
             best_steps = steps
             best_food = total_food_eaten
+            best_state = {k: v.detach().cpu().clone() for k, v in agent.model.state_dict().items()}
             no_improvement_count = 0
         else:
             no_improvement_count += 1
@@ -196,9 +179,12 @@ def train_snake(agent_id, num_episodes, device, population=None, generation=0):
             
         episode += 1
     
-    return agent, best_score
+    return agent, best_score, best_state
 
 def game_loop(agent, model_file, episode, headless=False):
+    if not headless:
+        sg.init_display()
+
     if model_file:
         agent.load_model(model_file)
     
@@ -286,12 +272,12 @@ def game_loop(agent, model_file, episode, headless=False):
             steps += 1
             
             if not headless:
-                dis.fill(black)
-                pygame.draw.rect(dis, green, [foodx, foody, cell_size, cell_size])
+                sg.dis.fill(black)
+                pygame.draw.rect(sg.dis, green, [foodx, foody, cell_size, cell_size])
                 for x in snake_List:
-                    pygame.draw.rect(dis, red, [x[0], x[1], cell_size, cell_size])
+                    pygame.draw.rect(sg.dis, red, [x[0], x[1], cell_size, cell_size])
                 pygame.display.update()
-                clock.tick(30)
+                sg.clock.tick(30)
         
         score = Length_of_snake - 1
         print(f'Episode {episode} - Score: {score}, Total Loss: {total_loss:.2f}, Total Reward: {total_reward:.2f}, Steps: {steps}, Food Eaten: {total_food_eaten}')
@@ -299,7 +285,7 @@ def game_loop(agent, model_file, episode, headless=False):
         if score > best_score:
             best_score = score
             no_improvement_count = 0
-            agent.save_model(episode)
+            agent.save_best(score)
         else:
             no_improvement_count += 1
             
@@ -367,7 +353,6 @@ def main():
             
             population = []
             best_overall_score = 0
-            best_overall_agent = None
             
             for generation in range(num_generations):
                 print(f"\nStarting Generation {generation + 1}/{num_generations}")
@@ -381,12 +366,12 @@ def main():
                     # Collect results
                     generation_results = []
                     for future in futures:
-                        agent, best_score = future.result()
+                        agent, best_score, best_state = future.result()
                         generation_results.append((agent, best_score))
-                        if best_score > best_overall_score:
+                        # One save per new overall best, overwriting the previous best
+                        if best_state is not None and best_score > best_overall_score:
                             best_overall_score = best_score
-                            best_overall_agent = agent
-                            best_overall_agent.save_model(num_episodes, f"best_overall_gen{generation}")
+                            agent.save_best(best_score, best_state)
                 
                 # Update population for next generation
                 population = [agent for agent, _ in generation_results]
@@ -401,8 +386,6 @@ def main():
             
             print("\nTraining Complete!")
             print(f"Best Overall Score: {best_overall_score}")
-            if best_overall_agent:
-                best_overall_agent.save_model(num_episodes, "best_final")
         else:
             print("Invalid choice. Please enter 1, 2, 3, or 4.")
 

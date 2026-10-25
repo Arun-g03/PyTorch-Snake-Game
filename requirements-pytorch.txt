@@ -1,0 +1,5 @@
+# Default/ - PyTorch PPO
+torch
+numpy
+matplotlib
+pygame
