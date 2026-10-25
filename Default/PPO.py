@@ -61,28 +61,11 @@ class ActorCritic(nn.Module):
         return logits, value
 
 
-class RolloutBuffer:
-    """One environment's trajectory. Plain python/numpy data, so nothing keeps an autograd graph alive."""
-    def __init__(self):
-        self.states = []
-        self.actions = []
-        self.logprobs = []
-        self.values = []
-        self.rewards = []
-        self.dones = []
-
-    def __len__(self):
-        return len(self.rewards)
-
-    def clear(self):
-        self.__init__()
-
-
 class PPOAgent:
-    """PPO agent for the snake, updating every `update_steps` environment steps with GAE.
+    """PPO agent for the snake: GAE advantages, minibatch updates, clipped objective.
 
-    Acts on `num_envs` games at once: select_actions() takes one batched forward pass for all of them,
-    and each environment keeps its own trajectory so advantages are computed per environment.
+    Works on a batch of games at once. All rollout data stays on `device` as [steps, games, ...]
+    tensors, so with a GPU environment nothing is copied to the CPU between updates.
     """
     model_type = "ppo"
 
@@ -93,143 +76,94 @@ class PPOAgent:
         self.hparams = {**HPARAMS, **overrides}
         h = self.hparams
 
-        self.device = device
+        self.device = torch.device(device)
         self.num_envs = num_envs
-        self.model = ActorCritic(state_dim, action_dim).to(device)
+        self.model = ActorCritic(state_dim, action_dim).to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=h['lr'], eps=1e-5, foreach=True)
-        self.buffers = [RolloutBuffer() for _ in range(num_envs)]
-
-        # Acting on a handful of states is fastest as plain numpy matrix maths on a CPU copy of the
-        # weights (no torch dispatch, no GPU sync); the copy is refreshed after every update.
-        self._refresh_rollout_weights()
-        self._rng = np.random.default_rng()
 
         self.gamma = h['gamma']
         self.gae_lambda = h['gae_lambda']
         self.clip_epsilon = h['clip_epsilon']
         self.k_epochs = h['k_epochs']
-        self.update_steps = h['update_steps']
-        self.minibatch_size = h['minibatch_size']
+        self.rollout_steps = h['rollout_steps']
         self.entropy_coeff = h['entropy_coeff']  # decays per update
+        self._clear_rollout()
 
-    def _refresh_rollout_weights(self):
-        w = {k: v.detach().cpu().numpy().astype(np.float32) for k, v in self.model.state_dict().items()}
-        self._w = dict(
-            w1=w['shared_fc1.weight'].T.copy(), b1=w['shared_fc1.bias'],
-            w2=w['shared_fc2.weight'].T.copy(), b2=w['shared_fc2.bias'],
-            wp=w['policy_fc.weight'].T.copy(), bp=w['policy_fc.bias'],
-            gp=w['policy_norm.weight'], np_=w['policy_norm.bias'],
-            wh=w['policy_head.weight'].T.copy(), bh=w['policy_head.bias'],
-            wv=w['value_fc.weight'].T.copy(), bv=w['value_fc.bias'],
-            gv=w['value_norm.weight'], nv=w['value_norm.bias'],
-            wo=w['value_head.weight'].T.copy(), bo=w['value_head.bias'],
-        )
-
-    @staticmethod
-    def _layer_norm(x, gamma, beta):
-        return (x - x.mean(-1, keepdims=True)) / np.sqrt(x.var(-1, keepdims=True) + 1e-5) * gamma + beta
-
-    def _forward(self, states):
-        """(logits [N, A], values [N]) for a batch of states - the ActorCritic forward pass in numpy."""
-        w = self._w
-        x = np.asarray(states, dtype=np.float32)
-        x = np.maximum(x @ w['w1'] + w['b1'], 0)
-        x = np.maximum(x @ w['w2'] + w['b2'], 0)
-        p = self._layer_norm(np.maximum(x @ w['wp'] + w['bp'], 0), w['gp'], w['np_'])
-        v = self._layer_norm(np.maximum(x @ w['wv'] + w['bv'], 0), w['gv'], w['nv'])
-        return p @ w['wh'] + w['bh'], (v @ w['wo'] + w['bo'])[:, 0]
-
-    @staticmethod
-    def _softmax(logits):
-        probs = np.exp(logits - logits.max(axis=-1, keepdims=True))
-        return probs / probs.sum(axis=-1, keepdims=True)
+    def _clear_rollout(self):
+        self._states, self._actions, self._logprobs = [], [], []
+        self._values, self._rewards, self._dones = [], [], []
 
     # Common agent interface used by main.py ---------------------------------------------------
+    @torch.no_grad()
     def select_actions(self, states):
-        """Sample one action per environment from a batch of states, recording what the update needs."""
-        states = np.array(states, dtype=np.float32)  # copy: the caller reuses and overwrites its array
-        logits, values = self._forward(states)
-        probs = self._softmax(logits)
-        draws = self._rng.random((len(states), 1))
-        actions = np.minimum((np.cumsum(probs, axis=1) < draws).sum(axis=1), probs.shape[1] - 1)
-        logprobs = np.log(probs[np.arange(len(states)), actions] + 1e-12)
-
-        for i, buffer in enumerate(self.buffers):
-            buffer.states.append(states[i])
-            buffer.actions.append(int(actions[i]))
-            buffer.logprobs.append(float(logprobs[i]))
-            buffer.values.append(float(values[i]))
+        """Sample one action per game from a batch of states [N, D], recording what the update needs."""
+        logits, values = self.model(states)
+        log_probs = torch.log_softmax(logits, dim=-1)
+        actions = torch.multinomial(log_probs.exp(), 1)[:, 0]
+        self._states.append(states)
+        self._actions.append(actions)
+        self._logprobs.append(log_probs.gather(1, actions[:, None])[:, 0])
+        self._values.append(values[:, 0])
         return actions
 
+    @torch.no_grad()
     def act(self, state, greedy=True):
         """Pick one action for one state without recording anything (used for watching a model play)."""
-        logits, _ = self._forward(np.asarray(state, dtype=np.float32)[None])
+        logits, _ = self.model(torch.as_tensor(state, dtype=torch.float32, device=self.device).reshape(1, -1))
         if greedy:
-            return int(logits[0].argmax())
-        return int(self._rng.choice(logits.shape[1], p=self._softmax(logits[0])))
+            return int(logits.argmax())
+        return int(torch.multinomial(torch.softmax(logits, dim=-1), 1))
 
-    def observe(self, env_index, state, action, reward, next_state, done):
-        """Record the outcome of the action chosen for environment `env_index` by select_actions()."""
-        buffer = self.buffers[env_index]
-        buffer.rewards.append(reward)
-        buffer.dones.append(float(done))
+    def observe(self, states, actions, rewards, next_states, dones):
+        """Record the outcome of the actions chosen by the last select_actions() call."""
+        self._rewards.append(rewards)
+        self._dones.append(dones.float())
 
     def update(self, next_states):
-        """Called after every batch of environment steps; `next_states` are the environments' current states."""
-        if self.should_update():
+        """Called after every step of all games; `next_states` are the games' current states."""
+        if len(self._rewards) >= self.rollout_steps:
             self.optimize_model(next_states)
 
-    def should_update(self):
-        return sum(len(b) for b in self.buffers) >= self.update_steps
+    @torch.no_grad()
+    def _advantages(self, next_states):
+        """GAE for every game at once. Returns (advantages, returns), both [T, N]."""
+        values = torch.stack(self._values)
+        rewards = torch.stack(self._rewards)
+        dones = torch.stack(self._dones)
+        next_value = self.model(next_states)[1][:, 0]  # bootstrap value after the last step
+
+        advantages = torch.zeros_like(values)
+        gae = torch.zeros_like(next_value)
+        for t in reversed(range(len(values))):
+            nonterminal = 1.0 - dones[t]  # a finished episode has nothing to bootstrap from
+            delta = rewards[t] + self.gamma * next_value * nonterminal - values[t]
+            gae = delta + self.gamma * self.gae_lambda * nonterminal * gae
+            advantages[t] = gae
+            next_value = values[t]
+        return advantages, advantages + values
 
     def optimize_model(self, next_states):
-        """Run the PPO update. `next_states` (one per environment) are used to bootstrap unfinished rollouts."""
+        """Run the PPO update on the collected rollout."""
         h = self.hparams
-        last_values = self._forward(np.asarray(next_states, dtype=np.float32))[1]
+        advantages, returns = self._advantages(next_states)
 
-        all_states, all_actions, all_logprobs, all_advantages, all_returns = [], [], [], [], []
-        for buffer, last_value in zip(self.buffers, last_values):
-            n = len(buffer)
-            if n == 0:
-                continue
-            rewards = np.asarray(buffer.rewards, dtype=np.float32)
-            dones = np.asarray(buffer.dones, dtype=np.float32)
-            values = np.asarray(buffer.values, dtype=np.float32)
+        state_dim = self._states[0].shape[-1]
+        states = torch.stack(self._states).reshape(-1, state_dim)
+        actions = torch.stack(self._actions).reshape(-1)
+        old_logprobs = torch.stack(self._logprobs).reshape(-1)
+        advantages, returns = advantages.reshape(-1), returns.reshape(-1)
+        self._clear_rollout()
 
-            # Generalised advantage estimation; a finished episode (done) has nothing to bootstrap from
-            advantages = np.zeros(n, dtype=np.float32)
-            gae = 0.0
-            for t in reversed(range(n)):
-                next_value = last_value if t == n - 1 else values[t + 1]
-                nonterminal = 1.0 - dones[t]
-                delta = rewards[t] + self.gamma * next_value * nonterminal - values[t]
-                gae = delta + self.gamma * self.gae_lambda * nonterminal * gae
-                advantages[t] = gae
-
-            all_states.extend(buffer.states)
-            all_actions.extend(buffer.actions)
-            all_logprobs.extend(buffer.logprobs)
-            all_advantages.append(advantages)
-            all_returns.append(advantages + values)
-            buffer.clear()
-
-        n = len(all_states)
-        if n == 0:
-            return
-
-        states = torch.as_tensor(np.stack(all_states), device=self.device)
-        actions = torch.as_tensor(all_actions, dtype=torch.int64, device=self.device)
-        old_logprobs = torch.as_tensor(all_logprobs, dtype=torch.float32, device=self.device)
-        advantages = torch.as_tensor(np.concatenate(all_advantages), device=self.device)
-        returns = torch.as_tensor(np.concatenate(all_returns), device=self.device)
+        n = len(states)
         if n > 1:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        minibatch_size = max(1, n // h['num_minibatches'])
 
         stop_early = False
         for _ in range(self.k_epochs):
             perm = torch.randperm(n, device=self.device)
-            for start in range(0, n, self.minibatch_size):
-                idx = perm[start:start + self.minibatch_size]
+            for start in range(0, n, minibatch_size):
+                idx = perm[start:start + minibatch_size]
 
                 logits, new_values = self.model(states[idx])
                 dist = torch.distributions.Categorical(logits=logits)
@@ -251,8 +185,8 @@ class PPOAgent:
                 self.optimizer.step()
 
                 with torch.no_grad():
-                    approx_kl = ((ratios - 1) - log_ratio).mean().item()
-                if approx_kl > 1.5 * h['target_kl']:
+                    approx_kl = ((ratios - 1) - log_ratio).mean()
+                if approx_kl > 1.5 * h['target_kl']:  # one sync per minibatch
                     stop_early = True
                     break
             if stop_early:
@@ -261,7 +195,6 @@ class PPOAgent:
         self.entropy_coeff = max(h['entropy_min'], self.entropy_coeff * h['entropy_decay'])
         for group in self.optimizer.param_groups:
             group['lr'] = max(h['lr_min'], group['lr'] * h['lr_decay'])
-        self._refresh_rollout_weights()
 
     def get_weights(self):
         """The network weights as a dict of numpy arrays (cheap to send between processes)."""
@@ -269,7 +202,6 @@ class PPOAgent:
 
     def set_weights(self, weights):
         self.model.load_state_dict({k: torch.from_numpy(np.asarray(v)) for k, v in weights.items()})
-        self._refresh_rollout_weights()
 
     def save_model(self, episode, score, best_score, force=False):
         """Save the latest model every `config.SAVE_EVERY` episodes (or when forced) and keep a single best.
@@ -280,6 +212,4 @@ class PPOAgent:
 
     def load_model(self, filename):
         """Load a checkpoint; returns (episode, best_score)."""
-        result = checkpoints.load(self.model, filename, self.device)
-        self._refresh_rollout_weights()
-        return result
+        return checkpoints.load(self.model, filename, self.device)

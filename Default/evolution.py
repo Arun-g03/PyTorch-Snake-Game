@@ -20,7 +20,8 @@ import torch
 
 import checkpoints
 from PPO import PPOAgent
-from snake_game import ACTION_DIM, SnakeGame
+from snake_game import ACTION_DIM
+from vec_game import VecSnakeGame
 
 
 def crossover(a, b):
@@ -42,10 +43,10 @@ def train_agent(agent_id, generation, num_episodes, weights=None):
     Fitness is the mean score over the last `config.EVO_FITNESS_WINDOW` episodes.
     """
     torch.set_num_threads(1)  # one thread per worker; the workers are the parallelism
-    game = SnakeGame()
+    env = VecSnakeGame(config.EVO_ENVS, device='cpu')
 
     def new_agent():
-        return PPOAgent(game.state_dim, ACTION_DIM, device='cpu')
+        return PPOAgent(env.state_dim, ACTION_DIM, device='cpu', num_envs=env.n)
 
     agent = new_agent()
     if weights is not None:
@@ -53,38 +54,40 @@ def train_agent(agent_id, generation, num_episodes, weights=None):
 
     scores = deque(maxlen=config.EVO_FITNESS_WINDOW)
     rewards = deque(maxlen=config.EVO_FITNESS_WINDOW)
-    best_score, since_best, episode, total_reward = -1, 0, 0, 0.0
-    state = game.reset()
+    best_score, since_best, episodes = -1, 0, 0
+    states = env.reset()
+    total_rewards = torch.zeros(env.n)
 
-    while episode < num_episodes:
-        action = int(agent.select_actions(state[None])[0])
-        next_state, reward, done, info = game.step(action)
-        agent.observe(0, state, action, reward, next_state, done)
-        total_reward += reward
+    while episodes < num_episodes:
+        actions = agent.select_actions(states)
+        next_states, step_rewards, dones, info = env.step(actions)
+        agent.observe(states, actions, step_rewards, next_states, dones)
+        total_rewards += step_rewards
 
-        if done:
-            scores.append(info['score'])
-            rewards.append(total_reward)
-            total_reward = 0.0
-            episode += 1
+        if dones.any():
+            rows = dones.nonzero()[:, 0]
+            for score, ret in zip(info['score'][rows].tolist(), total_rewards[rows].tolist()):
+                scores.append(score)
+                rewards.append(ret)
+                episodes += 1
+                if score > best_score:
+                    best_score, since_best = score, 0
+                else:
+                    since_best += 1
+                if episodes % 50 == 0:
+                    print(f"  gen {generation} agent {agent_id}: episode {episodes}/{num_episodes}, "
+                          f"recent avg score {np.mean(scores):.2f}", flush=True)
+            total_rewards[rows] = 0
+            states = env.reset_done(dones, next_states)
 
-            if info['score'] > best_score:
-                best_score, since_best = info['score'], 0
-            else:
-                since_best += 1
             # A stalled agent starts over with fresh weights instead of wasting the rest of its budget
-            if config.EVO_RESET_AFTER and since_best >= config.EVO_RESET_AFTER and episode < num_episodes:
+            if config.EVO_RESET_AFTER and since_best >= config.EVO_RESET_AFTER and episodes < num_episodes:
                 agent = new_agent()
                 best_score, since_best = -1, 0
                 print(f"  gen {generation} agent {agent_id}: no improvement, restarting from fresh weights")
-
-            if episode % 50 == 0:
-                print(f"  gen {generation} agent {agent_id}: episode {episode}/{num_episodes}, "
-                      f"recent avg score {np.mean(scores):.2f}", flush=True)
-            next_state = game.reset()
-
-        state = next_state
-        agent.update(state[None])
+        else:
+            states = next_states
+        agent.update(states)
 
     return agent_id, float(np.mean(scores)), float(np.mean(rewards)), agent.get_weights()
 

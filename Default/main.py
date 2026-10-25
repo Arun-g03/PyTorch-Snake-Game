@@ -4,19 +4,22 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root, for config.py
 import config
 import os
+import time
 from collections import deque
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from snake_game import SnakeGame, ACTION_DIM
+from snake_game import ACTION_DIM
+from vec_game import VecSnakeGame
 import checkpoints
 from DQN import DQNAgent
 from evolution import evolve
 from PPO import PPOAgent
 
-PLOT_EVERY = config.PLOT_EVERY
+PLOT_SECONDS = config.PLOT_SECONDS
+PRINT_SECONDS = config.PRINT_SECONDS
 AVG_WINDOW = config.AVG_WINDOW
 PLOT_WINDOW = config.PLOT_WINDOW
 
@@ -87,10 +90,12 @@ def main():
                           'cpu' if config.DEVICE == 'auto' else config.DEVICE)
     print(f"[INFO] Using device: {device}, model type: {config.MODEL_TYPE}")
 
-    # Training plays several games at once; watching (or a visible window) uses a single game
-    num_envs = 1 if (render or mode == "watch") else config.NUM_ENVS
-    games = [SnakeGame(render=render and i == 0) for i in range(num_envs)]
-    agent = make_agent(games[0].state_dim, device, num_envs)
+    # Training simulates many games at once; watching (or a visible window) uses a single game
+    num_envs = 1 if (render or mode == "watch") else resolve_num_envs(device)
+    env = VecSnakeGame(num_envs, device=device, render=render)
+    agent = make_agent(env.state_dim, device, num_envs)
+    if mode != "watch":
+        print(f"[INFO] Simulating {num_envs} game{'s' if num_envs != 1 else ''} in parallel")
 
     episode, best_score = 0, -float('inf')
     if model_file:
@@ -101,9 +106,15 @@ def main():
             return
 
     if mode == "watch":
-        watch(agent, games[0])
+        watch(agent, env)
     else:
-        train(agent, games, episode, best_score, render)
+        train(agent, env, episode, best_score, render)
+
+
+def resolve_num_envs(device):
+    if config.NUM_ENVS == "auto":
+        return 256 if torch.device(device).type == "cuda" else 16
+    return int(config.NUM_ENVS)
 
 
 def ask_int(prompt, default):
@@ -124,24 +135,24 @@ def run_evolution():
     evolve(num_agents, generations, episodes)
 
 
-def watch(agent, game):
+def watch(agent, env):
     """Play with the loaded model (no learning) until the window is closed or Ctrl+C."""
     print("Watching the model play - close the window or press Ctrl+C to stop.")
-    episode = 0
+    games = 0
+    state = env.reset()
     try:
         while True:
-            state = game.reset()
-            done = False
-            while not done:
-                state, _, done, info = game.step(agent.act(state, greedy=True))
-                if not game.render():
-                    return
-            print(f"Game {episode} - Score: {info['score']}, Steps: {info['steps']}")
-            episode += 1
+            state, _, done, info = env.step(torch.tensor([agent.act(state, greedy=True)], device=env.device))
+            if not env.render():
+                return
+            if bool(done[0]):
+                print(f"Game {games} - Score: {int(info['score'][0])}, Steps: {int(info['steps'][0])}")
+                games += 1
+                state = env.reset_done(done, state)
     except KeyboardInterrupt:
         pass
     finally:
-        game.close()
+        env.close()
 
 
 def make_plot():
@@ -163,7 +174,7 @@ def make_plot():
     return (ax1, ax2), lines
 
 
-def train(agent, games, start_episode=0, best_score=-float('inf'), render=False):
+def train(agent, env, start_episode=0, best_score=-float('inf'), render=False):
     (ax1, ax2), lines = make_plot()
 
     xdata = deque(maxlen=PLOT_WINDOW)
@@ -186,50 +197,63 @@ def train(agent, games, start_episode=0, best_score=-float('inf'), render=False)
 
     episode = start_episode  # lifetime episode number, continues from a loaded checkpoint
     run_episodes = 0         # episodes finished in this run - the plot's x axis starts from zero
-    states = np.stack([game.reset() for game in games])
-    total_rewards = [0.0] * len(games)
+    states = env.reset()
+    total_rewards = torch.zeros(env.n, device=env.device)
+    env_steps = 0
+    started = last_plot = last_print = time.monotonic()
+    steps_at_print = 0
     try:
         while True:
             actions = agent.select_actions(states)  # one batched forward pass for every game
+            next_states, rewards, dones, info = env.step(actions)
+            agent.observe(states, actions, rewards, next_states, dones)
+            total_rewards += rewards
+            env_steps += env.n
 
-            for i, game in enumerate(games):
-                next_state, reward, done, info = game.step(int(actions[i]))
-                agent.observe(i, states[i], actions[i], reward, next_state, done)
-                total_rewards[i] += reward
-
-                if done:
-                    print(f"Episode {episode} - Score: {info['score']}, Total Reward: {total_rewards[i]:.2f}, "
-                          f"Steps: {info['steps']}")
-
-                    recent_food.append(info['score'])
-                    recent_reward.append(total_rewards[i])
+            if dones.any():
+                rows = dones.nonzero()[:, 0]
+                scores, returns = info['score'][rows].tolist(), total_rewards[rows].tolist()
+                total_rewards[rows] = 0
+                for score, ret in zip(scores, returns):
+                    recent_food.append(score)
+                    recent_reward.append(ret)
                     xdata.append(run_episodes)
-                    food_data.append(info['score'])
-                    reward_data.append(total_rewards[i])
-                    food_avg_data.append(np.mean(recent_food))
-                    reward_avg_data.append(np.mean(recent_reward))
-                    if run_episodes % PLOT_EVERY == 0:
-                        update_plot()
-
-                    # Best model is judged on the rolling average, not a single lucky episode
-                    best_score = agent.save_model(episode, float(np.mean(recent_reward)), best_score)
-                    episode += 1
+                    food_data.append(score)
+                    reward_data.append(ret)
                     run_episodes += 1
-                    total_rewards[i] = 0.0
-                    next_state = game.reset()
+                finished = len(scores)
+                food_avg_data.extend([float(np.mean(recent_food))] * finished)
+                reward_avg_data.extend([float(np.mean(recent_reward))] * finished)
 
-                states[i] = next_state
+                # Save when this batch of episodes crossed a SAVE_EVERY boundary. The best model is
+                # judged on the rolling average, not a single lucky episode.
+                crossed = (episode + finished) // config.SAVE_EVERY > episode // config.SAVE_EVERY
+                episode += finished
+                if crossed:
+                    best_score = agent.save_model(episode, float(np.mean(recent_reward)), best_score, force=True)
 
+                states = env.reset_done(dones, next_states)
+            else:
+                states = next_states
             agent.update(states)
 
-            if render and not games[0].render():
+            now = time.monotonic()
+            if now - last_print >= PRINT_SECONDS and recent_food:
+                rate = (env_steps - steps_at_print) / (now - last_print)
+                print(f"Episode {episode} | avg score {np.mean(recent_food):.1f} (best {max(recent_food)}) | "
+                      f"avg reward {np.mean(recent_reward):.1f} | {rate:,.0f} steps/s")
+                last_print, steps_at_print = now, env_steps
+            if now - last_plot >= PLOT_SECONDS and xdata:
+                update_plot()
+                last_plot = time.monotonic()
+
+            if render and not env.render():
                 return
     except KeyboardInterrupt:
         print("\nInterrupted, saving latest model...")
     finally:
         agent.save_model(episode, -float('inf'), best_score, force=True)
-        for game in games:
-            game.close()
+        env.close()
 
 
 if __name__ == "__main__":
