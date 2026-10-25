@@ -140,3 +140,4 @@ node_modules/
 
 # Per-framework virtual environments (see env.ps1)
 .venv-*/
+prof.out
