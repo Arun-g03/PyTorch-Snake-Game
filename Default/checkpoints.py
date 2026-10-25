@@ -1,6 +1,7 @@
 """Checkpoint naming, saving and loading shared by all agent types."""
 import os
 
+import numpy as np
 import torch
 
 import config
@@ -19,10 +20,17 @@ def list_checkpoints(model_type):
     return sorted(f for f in os.listdir(config.MODEL_DIR) if f.startswith(prefix) and f.endswith(suffix))
 
 
-def _write(model, filename, episode, best_score):
+def _write(state_dict, filename, episode, best_score):
     os.makedirs(config.MODEL_DIR, exist_ok=True)
-    torch.save({"model_state": model.state_dict(), "episode": episode, "best_score": best_score},
+    torch.save({"model_state": state_dict, "episode": episode, "best_score": best_score},
                os.path.join(config.MODEL_DIR, filename))
+
+
+def save_weights(weights, kind, model_type, episode, best_score):
+    """Write a checkpoint from a dict of numpy weights (as produced by agent.get_weights())."""
+    filename = checkpoint_name(kind, model_type)
+    _write({k: torch.from_numpy(np.asarray(v)) for k, v in weights.items()}, filename, episode, best_score)
+    print(f"New best model saved (score {best_score:.2f}): {filename}")
 
 
 def save(model, model_type, episode, score, best_score, force=False):
@@ -32,10 +40,10 @@ def save(model, model_type, episode, score, best_score, force=False):
 
     if score > best_score:
         best_score = score
-        _write(model, checkpoint_name("best", model_type), episode, best_score)
+        _write(model.state_dict(), checkpoint_name("best", model_type), episode, best_score)
         print(f"New best model saved (score {best_score:.2f})")
 
-    _write(model, checkpoint_name("latest", model_type), episode, best_score)
+    _write(model.state_dict(), checkpoint_name("latest", model_type), episode, best_score)
     print(f"Latest model saved: {checkpoint_name('latest', model_type)}")
     return best_score
 

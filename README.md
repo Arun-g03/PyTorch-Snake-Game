@@ -23,9 +23,13 @@ cd Default
 python main.py
 ```
 
-Choose **1** to train a new model, **2** to continue a saved one, or **3** to watch a saved model play. Training asks whether to show the game window; it is headless by default. Press `Ctrl+C` to stop – the latest model is saved first.
+Choose **1** to train a new model, **2** to continue a saved one, **3** to watch a saved model play, or **4** to evolve a population of PPO agents in parallel. Training asks whether to show the game window; it is headless by default. Press `Ctrl+C` to stop – the latest model is saved first.
 
 Training plays `NUM_ENVS` games at once (default 8) and chooses all their moves in one batched forward pass; showing the game window (or watching a model) uses a single game. Pick the agent with `MODEL_TYPE = "ppo"` or `"dqn"` in `config.py`. Checkpoints are suffixed with the model type: `models/ptorch_latest_<type>.pth` (every 50 episodes and on exit) and `models/ptorch_best_<type>.pth` (best rolling-average reward). The load menu only lists checkpoints for the current `MODEL_TYPE`. Older checkpoints (e.g. `ptorch_ppo_latest.pth`) use the previous naming and a different network shape, so they won't be listed or load.
+
+### Evolution (option 4)
+
+Several PPO agents train in separate processes. After each generation the fittest two are crossed over and mutated to form the next generation (the best agent is kept unchanged, and an agent that stalls restarts fresh). Only a new overall best is saved, to `models/ptorch_evo_ppo.pth`, which loads like any other PPO checkpoint (options 2 and 3). The population size, generations, episodes and mutation settings are the `EVO_*` values in `config.py`.
 
 ## How it works
 

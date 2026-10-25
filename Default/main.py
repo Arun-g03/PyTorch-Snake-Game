@@ -13,6 +13,7 @@ import torch
 from snake_game import SnakeGame, ACTION_DIM
 import checkpoints
 from DQN import DQNAgent
+from evolution import evolve
 from PPO import PPOAgent
 
 PLOT_EVERY = config.PLOT_EVERY
@@ -53,27 +54,33 @@ def pick_model():
 
 
 def choose_mode():
-    """Terminal menu. Returns (mode, model_file) with mode in {'train', 'watch'}."""
+    """Terminal menu. Returns (mode, model_file) with mode in {'train', 'watch', 'evolve'}."""
     while True:
         print("Select an option:")
         print("1. Train a new model")
         print("2. Continue training a saved model")
         print("3. Watch a saved model play")
-        choice = input("Enter 1, 2 or 3: ").strip()
+        print("4. Evolve a population of PPO agents in parallel")
+        choice = input("Enter 1, 2, 3 or 4: ").strip()
 
         if choice == "1":
             return "train", None
+        if choice == "4":
+            return "evolve", None
         if choice in ("2", "3"):
             model_file = pick_model()
             if model_file:
                 return ("train" if choice == "2" else "watch"), model_file
         else:
-            print("Invalid choice. Please enter 1, 2 or 3.")
+            print("Invalid choice. Please enter 1, 2, 3 or 4.")
 
 
 def main():
     os.makedirs(config.MODEL_DIR, exist_ok=True)
     mode, model_file = choose_mode()
+    if mode == "evolve":
+        run_evolution()
+        return
     render = True if mode == "watch" else ask_yes_no("Show the game window while training? (slower)")
 
     device = torch.device('cuda' if config.DEVICE == 'auto' and torch.cuda.is_available() else
@@ -97,6 +104,24 @@ def main():
         watch(agent, games[0])
     else:
         train(agent, games, episode, best_score, render)
+
+
+def ask_int(prompt, default):
+    answer = input(f"{prompt} [{default}]: ").strip()
+    try:
+        return int(answer) if answer else default
+    except ValueError:
+        return default
+
+
+def run_evolution():
+    if config.MODEL_TYPE != "ppo":
+        print(f"Evolution trains PPO agents; set MODEL_TYPE = \"ppo\" in config.py (it is {config.MODEL_TYPE!r}).")
+        return
+    num_agents = ask_int("Number of parallel agents", config.EVO_AGENTS)
+    generations = ask_int("Number of generations", config.EVO_GENERATIONS)
+    episodes = ask_int("Episodes per agent per generation", config.EVO_EPISODES)
+    evolve(num_agents, generations, episodes)
 
 
 def watch(agent, game):
@@ -128,10 +153,10 @@ def make_plot():
         'reward': ax2.plot([], [], lw=2, label='Total Reward')[0],
         'reward_avg': ax2.plot([], [], lw=2, linestyle='--', label='Average Reward')[0],
     }
-    ax1.set_xlabel('Episode')
+    ax1.set_xlabel('Episode (this run)')
     ax1.set_ylabel('Food Eaten')
     ax1.legend()
-    ax2.set_xlabel('Episode')
+    ax2.set_xlabel('Episode (this run)')
     ax2.set_ylabel('Total Reward')
     ax2.axhline(y=0, color='r', linestyle='--')
     ax2.legend()
@@ -159,7 +184,8 @@ def train(agent, games, start_episode=0, best_score=-float('inf'), render=False)
             ax.autoscale_view()
         plt.pause(0.001)
 
-    episode = start_episode
+    episode = start_episode  # lifetime episode number, continues from a loaded checkpoint
+    run_episodes = 0         # episodes finished in this run - the plot's x axis starts from zero
     states = np.stack([game.reset() for game in games])
     total_rewards = [0.0] * len(games)
     try:
@@ -177,17 +203,18 @@ def train(agent, games, start_episode=0, best_score=-float('inf'), render=False)
 
                     recent_food.append(info['score'])
                     recent_reward.append(total_rewards[i])
-                    xdata.append(episode)
+                    xdata.append(run_episodes)
                     food_data.append(info['score'])
                     reward_data.append(total_rewards[i])
                     food_avg_data.append(np.mean(recent_food))
                     reward_avg_data.append(np.mean(recent_reward))
-                    if episode % PLOT_EVERY == 0:
+                    if run_episodes % PLOT_EVERY == 0:
                         update_plot()
 
                     # Best model is judged on the rolling average, not a single lucky episode
                     best_score = agent.save_model(episode, float(np.mean(recent_reward)), best_score)
                     episode += 1
+                    run_episodes += 1
                     total_rewards[i] = 0.0
                     next_state = game.reset()
 

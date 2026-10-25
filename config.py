@@ -32,7 +32,7 @@ REWARD_FARTHER = -0.1    # moved farther from the food
 # ---------------------------------------------------------------------------
 MODEL_TYPE = "ppo"          # "ppo" or "dqn" - which agent to train / watch
 PYTORCH_PREFIX = "ptorch"   # checkpoints are saved as <prefix>_<latest|best>_<MODEL_TYPE>.pth
-NUM_ENVS = 8                # games played in parallel while training (one batched forward pass per step)
+NUM_ENVS = 1                # games played in parallel while training (one batched forward pass per step)
 DEVICE = "auto"             # "auto" (use CUDA if available), "cuda" or "cpu"
 
 SAVE_EVERY = 50             # episodes between "latest" checkpoints
@@ -87,3 +87,12 @@ DQN_HPARAMS = dict(
     beta_frames=100000,       # ...annealed to 1.0 over this many steps
     max_grad_norm=1.0,
 )
+
+# --- Parallel evolution of PPO agents (menu option 4) ---
+EVO_AGENTS = 4              # agents trained in parallel, one process each
+EVO_GENERATIONS = 10
+EVO_EPISODES = 200          # episodes each agent trains per generation
+EVO_FITNESS_WINDOW = 20     # fitness = mean score over this agent's last N episodes
+EVO_MUTATION_RATE = 0.1     # chance that a weight tensor is mutated
+EVO_MUTATION_SCALE = 0.1    # size of the noise added to a mutated tensor
+EVO_RESET_AFTER = 100       # episodes without a new best score before an agent restarts fresh (0 = never)

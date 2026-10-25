@@ -43,6 +43,31 @@ HEADINGS = [(0, -1), (1, 0), (0, 1), (-1, 0)]
 RAY_DIRECTIONS = [(0, -1), (1, -1), (1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1)]
 
 
+# Lookup tables built once (the board never changes), so get_state() does dictionary lookups instead of
+# walking rays cell by cell.
+_MAX_STEPS = max(grid_w, grid_h)
+
+
+def _build_tables():
+    rays, neighbors = {}, {}
+    for hx in range(grid_w):
+        for hy in range(grid_h):
+            on_ray, wall = {}, []
+            for d, (dx, dy) in enumerate(RAY_DIRECTIONS):
+                x, y, k = hx + dx, hy + dy, 1
+                while 0 <= x < grid_w and 0 <= y < grid_h:
+                    on_ray[(x, y)] = (d, k)  # this cell is the k-th cell along ray d
+                    x, y, k = x + dx, y + dy, k + 1
+                wall.append(k / _MAX_STEPS)  # k is the first step that leaves the board
+            rays[(hx, hy)] = (on_ray, wall)
+            neighbors[(hx, hy)] = tuple((hx + dx, hy + dy) for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1))
+                                        if 0 <= hx + dx < grid_w and 0 <= hy + dy < grid_h)
+    return rays, neighbors
+
+
+_RAYS, _NEIGHBORS = _build_tables()
+
+
 def calculate_reward(prev_distance, new_distance, ate_food, died):
     """Reward for one step: food and death dominate, distance shaping is symmetric."""
     if died:
@@ -138,21 +163,23 @@ class SnakeGame:
     def get_state(self):
         """Wall/body distance and food closeness along 8 rays, one-hot heading, length."""
         hx, hy = self.head
-        max_steps = max(grid_w, grid_h)
-        wall, body, food = [], [], []
+        max_steps = _MAX_STEPS
+        on_ray, wall = _RAYS[self.head]
 
-        for dx, dy in RAY_DIRECTIONS:
-            x, y, k = hx + dx, hy + dy, 1
-            body_k = food_k = None
-            while 0 <= x < grid_w and 0 <= y < grid_h:
-                if body_k is None and (x, y) in self.body:
-                    body_k = k
-                if food_k is None and (x, y) == self.food:
-                    food_k = k
-                x, y, k = x + dx, y + dy, k + 1
-            wall.append(k / max_steps)
-            body.append(1.0 if body_k is None else body_k / max_steps)
-            food.append(0.0 if food_k is None else 1.0 / food_k)
+        # Nearest body cell on each ray (the head itself is never on its own rays)
+        body_k = [None] * 8
+        for cell in self.body:
+            hit = on_ray.get(cell)
+            if hit is not None:
+                d, k = hit
+                if body_k[d] is None or k < body_k[d]:
+                    body_k[d] = k
+        body = [1.0 if k is None else k / max_steps for k in body_k]
+
+        food = [0.0] * 8
+        hit = on_ray.get(self.food)
+        if hit is not None:
+            food[hit[0]] = 1.0 / hit[1]
 
         heading = [1.0 if h == self.heading else 0.0 for h in HEADINGS]
         length_norm = len(self.snake) / (grid_w * grid_h)
@@ -190,16 +217,14 @@ class SnakeGame:
         open board and only does real work when the snake is close to trapping itself.
         """
         need = len(self.snake) + 1
-        blocked = self.body - {self.snake[0]}  # the tail moves away
+        body, tail = self.body, self.snake[0]  # the tail moves away, so it does not block
         seen = {start}
         stack = [start]
         while stack and len(seen) < need:
-            x, y = stack.pop()
-            for nx, ny in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
-                if (0 <= nx < grid_w and 0 <= ny < grid_h
-                        and (nx, ny) not in seen and (nx, ny) not in blocked):
-                    seen.add((nx, ny))
-                    stack.append((nx, ny))
+            for cell in _NEIGHBORS[stack.pop()]:
+                if cell not in seen and (cell not in body or cell == tail):
+                    seen.add(cell)
+                    stack.append(cell)
         return min(1.0, len(seen) / need)
 
     def render(self):

@@ -99,13 +99,9 @@ class PPOAgent:
         self.optimizer = optim.Adam(self.model.parameters(), lr=h['lr'], eps=1e-5, foreach=True)
         self.buffers = [RolloutBuffer() for _ in range(num_envs)]
 
-        # Acting is faster on the CPU than on a GPU for small batches (launch + sync overhead
-        # dominates), so rollouts use a CPU copy of the network that is re-synced after every update.
-        if torch.device(device).type == 'cpu':
-            self._rollout_model = self.model
-        else:
-            self._rollout_model = ActorCritic(state_dim, action_dim)
-            self._sync_rollout_model()
+        # Acting on a handful of states is fastest as plain numpy matrix maths on a CPU copy of the
+        # weights (no torch dispatch, no GPU sync); the copy is refreshed after every update.
+        self._refresh_rollout_weights()
         self._rng = np.random.default_rng()
 
         self.gamma = h['gamma']
@@ -116,16 +112,32 @@ class PPOAgent:
         self.minibatch_size = h['minibatch_size']
         self.entropy_coeff = h['entropy_coeff']  # decays per update
 
-    def _sync_rollout_model(self):
-        if self._rollout_model is not self.model:
-            self._rollout_model.load_state_dict(self.model.state_dict())
+    def _refresh_rollout_weights(self):
+        w = {k: v.detach().cpu().numpy().astype(np.float32) for k, v in self.model.state_dict().items()}
+        self._w = dict(
+            w1=w['shared_fc1.weight'].T.copy(), b1=w['shared_fc1.bias'],
+            w2=w['shared_fc2.weight'].T.copy(), b2=w['shared_fc2.bias'],
+            wp=w['policy_fc.weight'].T.copy(), bp=w['policy_fc.bias'],
+            gp=w['policy_norm.weight'], np_=w['policy_norm.bias'],
+            wh=w['policy_head.weight'].T.copy(), bh=w['policy_head.bias'],
+            wv=w['value_fc.weight'].T.copy(), bv=w['value_fc.bias'],
+            gv=w['value_norm.weight'], nv=w['value_norm.bias'],
+            wo=w['value_head.weight'].T.copy(), bo=w['value_head.bias'],
+        )
 
-    @torch.inference_mode()
+    @staticmethod
+    def _layer_norm(x, gamma, beta):
+        return (x - x.mean(-1, keepdims=True)) / np.sqrt(x.var(-1, keepdims=True) + 1e-5) * gamma + beta
+
     def _forward(self, states):
-        """(logits [N, A], values [N]) as numpy for a batch of states, from the rollout network."""
-        x = torch.from_numpy(np.asarray(states, dtype=np.float32))
-        logits, values = self._rollout_model(x)
-        return logits.numpy(), values[:, 0].numpy()
+        """(logits [N, A], values [N]) for a batch of states - the ActorCritic forward pass in numpy."""
+        w = self._w
+        x = np.asarray(states, dtype=np.float32)
+        x = np.maximum(x @ w['w1'] + w['b1'], 0)
+        x = np.maximum(x @ w['w2'] + w['b2'], 0)
+        p = self._layer_norm(np.maximum(x @ w['wp'] + w['bp'], 0), w['gp'], w['np_'])
+        v = self._layer_norm(np.maximum(x @ w['wv'] + w['bv'], 0), w['gv'], w['nv'])
+        return p @ w['wh'] + w['bh'], (v @ w['wo'] + w['bo'])[:, 0]
 
     @staticmethod
     def _softmax(logits):
@@ -249,7 +261,15 @@ class PPOAgent:
         self.entropy_coeff = max(h['entropy_min'], self.entropy_coeff * h['entropy_decay'])
         for group in self.optimizer.param_groups:
             group['lr'] = max(h['lr_min'], group['lr'] * h['lr_decay'])
-        self._sync_rollout_model()
+        self._refresh_rollout_weights()
+
+    def get_weights(self):
+        """The network weights as a dict of numpy arrays (cheap to send between processes)."""
+        return {k: v.detach().cpu().numpy().copy() for k, v in self.model.state_dict().items()}
+
+    def set_weights(self, weights):
+        self.model.load_state_dict({k: torch.from_numpy(np.asarray(v)) for k, v in weights.items()})
+        self._refresh_rollout_weights()
 
     def save_model(self, episode, score, best_score, force=False):
         """Save the latest model every `config.SAVE_EVERY` episodes (or when forced) and keep a single best.
@@ -261,5 +281,5 @@ class PPOAgent:
     def load_model(self, filename):
         """Load a checkpoint; returns (episode, best_score)."""
         result = checkpoints.load(self.model, filename, self.device)
-        self._sync_rollout_model()
+        self._refresh_rollout_weights()
         return result
